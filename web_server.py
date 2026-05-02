@@ -6,9 +6,8 @@ Interface web type SSL Labs
 
 import json
 import threading
-import uuid
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify
 from dataclasses import asdict
 
 from ssl_scanner import SSLScanner, ScanResult
@@ -22,8 +21,9 @@ MAX_HISTORY = 50
 
 
 def store_result(result: ScanResult):
+    key = f"{result.host}:{result.port}"
     with scan_history_lock:
-        scan_history[result.host] = {
+        scan_history[key] = {
             "result": asdict(result),
             "timestamp": datetime.utcnow().isoformat()
         }
@@ -63,9 +63,12 @@ def api_scan():
         return jsonify({"error": "Port invalide (1-65535)"}), 400
 
     check_protocols = data.get("check_protocols", True)
+    check_headers = data.get("check_headers", True)
     timeout = min(float(data.get("timeout", 15.0)), 30.0)
 
-    scanner = SSLScanner(timeout=timeout, check_protocols=check_protocols)
+    scanner = SSLScanner(timeout=timeout,
+                         check_protocols=check_protocols,
+                         check_headers=check_headers)
 
     try:
         result = scanner.scan(host, port)
@@ -81,12 +84,13 @@ def api_history():
     with scan_history_lock:
         history = [
             {
-                "host": host,
+                "host": data["result"]["host"],
+                "port": data["result"]["port"],
                 "grade": data["result"]["grade"],
                 "score": data["result"]["score"],
                 "timestamp": data["timestamp"]
             }
-            for host, data in list(scan_history.items())[-10:]
+            for key, data in list(scan_history.items())[-10:]
         ]
     return jsonify(list(reversed(history)))
 
@@ -95,7 +99,12 @@ def api_history():
 def api_scan_get(host):
     """Scan via GET pour faciliter les tests."""
     port = int(request.args.get("port", 443))
-    scanner = SSLScanner(timeout=15.0, check_protocols=True)
+    timeout = min(float(request.args.get("timeout", 15)), 30)
+    check_protocols = request.args.get("protocols", "1") != "0"
+    check_headers = request.args.get("headers", "1") != "0"
+    scanner = SSLScanner(timeout=timeout,
+                         check_protocols=check_protocols,
+                         check_headers=check_headers)
     try:
         result = scanner.scan(host, port)
         store_result(result)

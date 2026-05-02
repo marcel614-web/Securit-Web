@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-SSL Scanner v2 - Outil d'analyse SSL/TLS simplifié type SSL Labs
-CORRECTIONS : parsing certificat DER natif, cipher bits réels, HSTS fiable
+SSL Scanner v2.2 – Analyse SSL/TLS professionnelle
+Cipher suites : test individuel par suite (multi-thread)
+HSTS : http.client avec suivi manuel des redirections (changement d'hôte géré)
 """
 
 import ssl
@@ -11,10 +12,15 @@ import json
 import hashlib
 import time
 import re
+import warnings
+import http.client
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
-import urllib.request
-import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
+
+warnings.filterwarnings("ignore", message=".*TLS.*")
+warnings.filterwarnings("ignore", message=".*SSL.*")
 
 # ─────────────────────────────────────────
 #  Structures de données
@@ -93,66 +99,126 @@ class ScanResult:
 
 
 # ─────────────────────────────────────────
-#  Table des bits réels par cipher name
+#  Liste des suites connues par protocole
 # ─────────────────────────────────────────
 
+CIPHER_SUITES_BY_PROTO = {
+    "TLSv1.3": [
+        "TLS_AES_256_GCM_SHA384",
+        "TLS_AES_128_GCM_SHA256",
+        "TLS_CHACHA20_POLY1305_SHA256",
+        "TLS_AES_128_CCM_SHA256",
+        "TLS_AES_128_CCM_8_SHA256",
+    ],
+    "TLSv1.2": [
+        "ECDHE-ECDSA-AES256-GCM-SHA384",
+        "ECDHE-ECDSA-AES128-GCM-SHA256",
+        "ECDHE-ECDSA-CHACHA20-POLY1305",
+        "ECDHE-RSA-AES256-GCM-SHA384",
+        "ECDHE-RSA-AES128-GCM-SHA256",
+        "ECDHE-RSA-CHACHA20-POLY1305",
+        "DHE-RSA-AES256-GCM-SHA384",
+        "DHE-RSA-AES128-GCM-SHA256",
+        "DHE-RSA-CHACHA20-POLY1305",
+        "AES256-GCM-SHA384",
+        "AES128-GCM-SHA256",
+        "AES256-SHA256",
+        "AES128-SHA256",
+        "AES256-SHA",
+        "AES128-SHA",
+        "DES-CBC3-SHA",
+        "RC4-SHA",
+        "RC4-MD5",
+        "NULL-SHA",
+        "NULL-MD5",
+    ],
+    "TLSv1.1": [
+        "ECDHE-ECDSA-AES256-SHA",
+        "ECDHE-ECDSA-AES128-SHA",
+        "ECDHE-RSA-AES256-SHA",
+        "ECDHE-RSA-AES128-SHA",
+        "DHE-RSA-AES256-SHA",
+        "DHE-RSA-AES128-SHA",
+        "AES256-SHA",
+        "AES128-SHA",
+        "DES-CBC3-SHA",
+        "RC4-SHA",
+        "RC4-MD5",
+    ],
+    "TLSv1.0": [
+        "ECDHE-ECDSA-AES256-SHA",
+        "ECDHE-ECDSA-AES128-SHA",
+        "ECDHE-RSA-AES256-SHA",
+        "ECDHE-RSA-AES128-SHA",
+        "DHE-RSA-AES256-SHA",
+        "DHE-RSA-AES128-SHA",
+        "AES256-SHA",
+        "AES128-SHA",
+        "DES-CBC3-SHA",
+        "RC4-SHA",
+        "RC4-MD5",
+    ],
+    "SSLv3": [
+        "AES256-SHA",
+        "AES128-SHA",
+        "DES-CBC3-SHA",
+        "RC4-SHA",
+        "RC4-MD5",
+        "NULL-SHA",
+        "NULL-MD5",
+    ],
+}
+
 CIPHER_BITS_MAP: Dict[str, int] = {
-    # TLS 1.3
-    "TLS_AES_256_GCM_SHA384":           256,
-    "TLS_AES_128_GCM_SHA256":           128,
-    "TLS_CHACHA20_POLY1305_SHA256":     256,
-    "TLS_AES_128_CCM_SHA256":           128,
-    "TLS_AES_128_CCM_8_SHA256":         128,
-    # ECDHE-ECDSA
-    "ECDHE-ECDSA-AES256-GCM-SHA384":    256,
-    "ECDHE-ECDSA-AES128-GCM-SHA256":    128,
-    "ECDHE-ECDSA-CHACHA20-POLY1305":    256,
-    "ECDHE-ECDSA-AES256-SHA384":        256,
-    "ECDHE-ECDSA-AES128-SHA256":        128,
-    "ECDHE-ECDSA-AES256-SHA":           256,
-    "ECDHE-ECDSA-AES128-SHA":           128,
-    "ECDHE-ECDSA-DES-CBC3-SHA":         112,
-    # ECDHE-RSA
-    "ECDHE-RSA-AES256-GCM-SHA384":      256,
-    "ECDHE-RSA-AES128-GCM-SHA256":      128,
-    "ECDHE-RSA-CHACHA20-POLY1305":      256,
-    "ECDHE-RSA-AES256-SHA384":          256,
-    "ECDHE-RSA-AES128-SHA256":          128,
-    "ECDHE-RSA-AES256-SHA":             256,
-    "ECDHE-RSA-AES128-SHA":             128,
-    "ECDHE-RSA-DES-CBC3-SHA":           112,
-    "ECDHE-RSA-RC4-SHA":                128,
-    # DHE-RSA
-    "DHE-RSA-AES256-GCM-SHA384":        256,
-    "DHE-RSA-AES128-GCM-SHA256":        128,
-    "DHE-RSA-CHACHA20-POLY1305":        256,
-    "DHE-RSA-AES256-SHA256":            256,
-    "DHE-RSA-AES128-SHA256":            128,
-    "DHE-RSA-AES256-SHA":               256,
-    "DHE-RSA-AES128-SHA":               128,
-    "DHE-RSA-DES-CBC3-SHA":             112,
-    # DHE-DSS
-    "DHE-DSS-AES256-GCM-SHA384":        256,
-    "DHE-DSS-AES128-GCM-SHA256":        128,
-    "DHE-DSS-AES256-SHA256":            256,
-    "DHE-DSS-AES128-SHA256":            128,
-    "DHE-DSS-AES256-SHA":               256,
-    "DHE-DSS-AES128-SHA":               128,
-    # RSA (no PFS)
-    "AES256-GCM-SHA384":                256,
-    "AES128-GCM-SHA256":                128,
-    "AES256-SHA256":                    256,
-    "AES128-SHA256":                    128,
-    "AES256-SHA":                       256,
-    "AES128-SHA":                       128,
-    "DES-CBC3-SHA":                     112,
-    "RC4-SHA":                          128,
-    "RC4-MD5":                          128,
-    # Insecure
-    "NULL-SHA":                         0,
-    "NULL-MD5":                         0,
-    "EXP-RC4-MD5":                      40,
-    "EXP-DES-CBC-SHA":                  40,
+    "TLS_AES_256_GCM_SHA384": 256,
+    "TLS_AES_128_GCM_SHA256": 128,
+    "TLS_CHACHA20_POLY1305_SHA256": 256,
+    "TLS_AES_128_CCM_SHA256": 128,
+    "TLS_AES_128_CCM_8_SHA256": 128,
+    "ECDHE-ECDSA-AES256-GCM-SHA384": 256,
+    "ECDHE-ECDSA-AES128-GCM-SHA256": 128,
+    "ECDHE-ECDSA-CHACHA20-POLY1305": 256,
+    "ECDHE-ECDSA-AES256-SHA384": 256,
+    "ECDHE-ECDSA-AES128-SHA256": 128,
+    "ECDHE-ECDSA-AES256-SHA": 256,
+    "ECDHE-ECDSA-AES128-SHA": 128,
+    "ECDHE-ECDSA-DES-CBC3-SHA": 112,
+    "ECDHE-RSA-AES256-GCM-SHA384": 256,
+    "ECDHE-RSA-AES128-GCM-SHA256": 128,
+    "ECDHE-RSA-CHACHA20-POLY1305": 256,
+    "ECDHE-RSA-AES256-SHA384": 256,
+    "ECDHE-RSA-AES128-SHA256": 128,
+    "ECDHE-RSA-AES256-SHA": 256,
+    "ECDHE-RSA-AES128-SHA": 128,
+    "ECDHE-RSA-DES-CBC3-SHA": 112,
+    "ECDHE-RSA-RC4-SHA": 128,
+    "DHE-RSA-AES256-GCM-SHA384": 256,
+    "DHE-RSA-AES128-GCM-SHA256": 128,
+    "DHE-RSA-CHACHA20-POLY1305": 256,
+    "DHE-RSA-AES256-SHA256": 256,
+    "DHE-RSA-AES128-SHA256": 128,
+    "DHE-RSA-AES256-SHA": 256,
+    "DHE-RSA-AES128-SHA": 128,
+    "DHE-RSA-DES-CBC3-SHA": 112,
+    "DHE-DSS-AES256-GCM-SHA384": 256,
+    "DHE-DSS-AES128-GCM-SHA256": 128,
+    "DHE-DSS-AES256-SHA256": 256,
+    "DHE-DSS-AES128-SHA256": 128,
+    "DHE-DSS-AES256-SHA": 256,
+    "DHE-DSS-AES128-SHA": 128,
+    "AES256-GCM-SHA384": 256,
+    "AES128-GCM-SHA256": 128,
+    "AES256-SHA256": 256,
+    "AES128-SHA256": 128,
+    "AES256-SHA": 256,
+    "AES128-SHA": 128,
+    "DES-CBC3-SHA": 112,
+    "RC4-SHA": 128,
+    "RC4-MD5": 128,
+    "NULL-SHA": 0,
+    "NULL-MD5": 0,
+    "EXP-RC4-MD5": 40,
+    "EXP-DES-CBC-SHA": 40,
 }
 
 INSECURE_KW = ["NULL", "EXP-", "EXPORT", "ANON", "ANULL", "ENULL", "RC4", "RC2", "IDEA"]
@@ -161,75 +227,47 @@ WEAK_KW     = ["DES-CBC3", "3DES", "DES-CBC-", "SEED"]
 
 def _cipher_strength(name: str, bits: int) -> str:
     nu = name.upper()
-
     for kw in INSECURE_KW:
         if kw in nu:
             return "insecure"
-
-    # bits = 0 uniquement si vraiment inconnu — on les déduit
     if bits == 0:
         bits = CIPHER_BITS_MAP.get(name, 0)
-    if bits == 0:
-        if   "256" in nu:                                             bits = 256
-        elif "128" in nu:                                             bits = 128
-        elif "CHACHA20" in nu or "POLY1305" in nu:                   bits = 256
-        elif "3DES" in nu or "DES-CBC3" in nu:                       bits = 112
-
     if bits > 0 and bits < 112:
         return "insecure"
-
     for kw in WEAK_KW:
         if kw in nu:
             return "weak"
-
-    if bits == 0:
-        return "acceptable"
-
-    # AEAD + ECDHE/DHE ou TLS 1.3 → strong
     if any(x in nu for x in ["GCM", "CCM", "POLY1305", "CHACHA20", "TLS_"]):
         return "strong"
-
-    # AES-CBC avec PFS → acceptable
     return "acceptable"
 
 
 # ─────────────────────────────────────────
-#  Parseur ASN.1 DER minimal (stdlib only)
+#  Parseur ASN.1 DER (complet)
 # ─────────────────────────────────────────
 
 class _DER:
     OID_MAP = {
-        # DN attributes
-        "2.5.4.3":               "CN",
-        "2.5.4.6":               "C",
-        "2.5.4.7":               "L",
-        "2.5.4.8":               "ST",
-        "2.5.4.10":              "O",
-        "2.5.4.11":              "OU",
-        "1.2.840.113549.1.9.1":  "email",
-        # Signature algorithms
-        "1.2.840.113549.1.1.4":  "md5WithRSAEncryption",
-        "1.2.840.113549.1.1.5":  "sha1WithRSAEncryption",
+        "2.5.4.3": "CN", "2.5.4.6": "C", "2.5.4.7": "L",
+        "2.5.4.8": "ST", "2.5.4.10": "O", "2.5.4.11": "OU",
+        "1.2.840.113549.1.9.1": "email",
+        "1.2.840.113549.1.1.4": "md5WithRSAEncryption",
+        "1.2.840.113549.1.1.5": "sha1WithRSAEncryption",
         "1.2.840.113549.1.1.11": "sha256WithRSAEncryption",
         "1.2.840.113549.1.1.12": "sha384WithRSAEncryption",
         "1.2.840.113549.1.1.13": "sha512WithRSAEncryption",
-        "1.2.840.10045.4.3.1":   "ecdsa-with-SHA224",
-        "1.2.840.10045.4.3.2":   "ecdsa-with-SHA256",
-        "1.2.840.10045.4.3.3":   "ecdsa-with-SHA384",
-        "1.2.840.10045.4.3.4":   "ecdsa-with-SHA512",
-        "1.3.101.112":           "Ed25519",
-        "1.3.101.113":           "Ed448",
-        # Key algorithms
-        "1.2.840.113549.1.1.1":  "rsaEncryption",
-        "1.2.840.10045.2.1":     "ecPublicKey",
-        "1.2.840.10040.4.1":     "dsaEncryption",
-        "1.3.101.110":           "X25519",
-        "1.3.101.111":           "X448",
-        # EC curves
-        "1.2.840.10045.3.1.7":   "P-256",
-        "1.3.132.0.34":          "P-384",
-        "1.3.132.0.35":          "P-521",
-        "1.3.132.0.10":          "secp256k1",
+        "1.2.840.10045.4.3.1": "ecdsa-with-SHA224",
+        "1.2.840.10045.4.3.2": "ecdsa-with-SHA256",
+        "1.2.840.10045.4.3.3": "ecdsa-with-SHA384",
+        "1.2.840.10045.4.3.4": "ecdsa-with-SHA512",
+        "1.3.101.112": "Ed25519", "1.3.101.113": "Ed448",
+        "1.2.840.113549.1.1.1": "rsaEncryption",
+        "1.2.840.10045.2.1": "ecPublicKey",
+        "1.2.840.10040.4.1": "dsaEncryption",
+        "1.3.101.110": "X25519", "1.3.101.111": "X448",
+        "1.2.840.10045.3.1.7": "P-256",
+        "1.3.132.0.34": "P-384", "1.3.132.0.35": "P-521",
+        "1.3.132.0.10": "secp256k1",
     }
     EC_BITS = {"P-256": 256, "P-384": 384, "P-521": 521, "secp256k1": 256}
 
@@ -305,8 +343,7 @@ class _DER:
             _, cert, _ = cls.tlv(der, 0)
             pos = 0
             _, tbs,  pos = cls.tlv(cert, pos)
-            _, siga, pos = cls.tlv(cert, pos)   # outer sig alg
-            # outer sig alg OID
+            _, siga, pos = cls.tlv(cert, pos)
             sap = 0; _, sa_oid, sap = cls.tlv(siga, sap)
             r["sig_alg"] = cls.OID_MAP.get(cls.oid(sa_oid), cls.oid(sa_oid))
             cls._tbs(tbs, r)
@@ -319,15 +356,15 @@ class _DER:
         while pos < len(data):
             try:
                 tag, val, pos = cls.tlv(data, pos)
-                if tag == 0xa0:                         # [0] version
+                if tag == 0xa0:
                     _, vv, _ = cls.tlv(val, 0)
                     r["version"] = int.from_bytes(vv,"big")+1; continue
                 if field == 0:   r["serial"] = val.hex().upper()
-                elif field == 1:                        # inner sig alg
+                elif field == 1:
                     p2=0; _, ob, p2 = cls.tlv(val,p2)
                     o = cls.oid(ob); r["sig_alg"] = cls.OID_MAP.get(o,o)
                 elif field == 2: r["issuer"]  = cls.name(val)
-                elif field == 3:                        # validity
+                elif field == 3:
                     vp=0
                     nbt,nbv,vp = cls.tlv(val,vp)
                     nat,nav,_  = cls.tlv(val,vp)
@@ -375,7 +412,7 @@ class _DER:
                 _, ext, p = cls.tlv(seq,p)
                 ep=0; _, ob, ep = cls.tlv(ext,ep)
                 eo = cls.oid(ob)
-                if ext[ep] == 0x01: _,_,ep = cls.tlv(ext,ep)   # skip critical
+                if ext[ep] == 0x01: _,_,ep = cls.tlv(ext,ep)
                 if ep < len(ext):
                     _, osv, _ = cls.tlv(ext,ep)
                     if eo == "2.5.29.17": cls._san(osv, r)
@@ -397,10 +434,6 @@ class _DER:
         except: pass
 
 
-# ─────────────────────────────────────────
-#  Analyse du certificat
-# ─────────────────────────────────────────
-
 def analyze_certificate(der: bytes) -> CertificateInfo:
     p = _DER.parse(der)
     subject = p["subject"]
@@ -419,7 +452,6 @@ def analyze_certificate(der: bytes) -> CertificateInfo:
     sha1   = ":".join(hashlib.sha1(der).hexdigest().upper()[i:i+2]   for i in range(0,40,2))
     sha256 = ":".join(hashlib.sha256(der).hexdigest().upper()[i:i+2] for i in range(0,64,2))
 
-    # Certificat auto-signé : sujet == émetteur (même CN ET même O)
     def _norm(d): return {k:v.strip() for k,v in d.items()}
     is_self_signed = bool(subject and issuer and _norm(subject) == _norm(issuer))
 
@@ -440,14 +472,16 @@ def analyze_certificate(der: bytes) -> CertificateInfo:
 #  Détection des protocoles
 # ─────────────────────────────────────────
 
-def _try_tls(host: str, port: int, minv: ssl.TLSVersion, maxv: ssl.TLSVersion,
-             timeout: float = 5.0) -> bool:
+def _try_tls(host: str, port: int, minv, maxv, timeout: float = 5.0) -> bool:
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode    = ssl.CERT_NONE
-        ctx.minimum_version = minv
-        ctx.maximum_version = maxv
+        try:
+            ctx.minimum_version = minv
+            ctx.maximum_version = maxv
+        except AttributeError:
+            pass
         with socket.create_connection((host, port), timeout=timeout) as s:
             with ctx.wrap_socket(s, server_hostname=host) as ss:
                 ss.do_handshake()
@@ -455,87 +489,163 @@ def _try_tls(host: str, port: int, minv: ssl.TLSVersion, maxv: ssl.TLSVersion,
     except: return False
 
 
-def check_protocol_support(host: str, port: int) -> ProtocolSupport:
-    tls13 = _try_tls(host, port, ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_3)
-    tls12 = _try_tls(host, port, ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_2)
-    tls11 = tls10 = False
-    try: tls11 = _try_tls(host, port, ssl.TLSVersion.TLSv1_1, ssl.TLSVersion.TLSv1_1)
-    except (AttributeError, ssl.SSLError): pass
-    try: tls10 = _try_tls(host, port, ssl.TLSVersion.TLSv1,   ssl.TLSVersion.TLSv1)
-    except (AttributeError, ssl.SSLError): pass
-    return ProtocolSupport(ssl2=False, ssl3=False, tls10=tls10, tls11=tls11, tls12=tls12, tls13=tls13)
+def check_protocol_support(host: str, port: int, timeout: float = 10.0) -> ProtocolSupport:
+    tls13 = _try_tls(host, port, ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_3, timeout)
+    tls12 = _try_tls(host, port, ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_2, timeout)
+
+    TLSv1_1 = getattr(ssl.TLSVersion, 'TLSv1_1', None)
+    tls11 = _try_tls(host, port, TLSv1_1, TLSv1_1, timeout) if TLSv1_1 else False
+
+    TLSv1_0 = getattr(ssl.TLSVersion, 'TLSv1_0', None)
+    tls10 = _try_tls(host, port, TLSv1_0, TLSv1_0, timeout) if TLSv1_0 else False
+
+    return ProtocolSupport(ssl2=False, ssl3=False,
+                           tls10=tls10, tls11=tls11, tls12=tls12, tls13=tls13)
 
 
 # ─────────────────────────────────────────
-#  Énumération des cipher suites
+#  Énumération des suites (test individuel)
 # ─────────────────────────────────────────
 
-def enumerate_ciphers(host: str, port: int) -> List[CipherSuite]:
-    seen: set = set()
-    result: List[CipherSuite] = []
-
-    def add(name: str, proto: str, bits: int):
-        if not name or name in seen: return
-        seen.add(name)
-        if not bits: bits = CIPHER_BITS_MAP.get(name, 0)
-        result.append(CipherSuite(name=name, protocol=proto or "TLS",
-                                  bits=bits, strength=_cipher_strength(name, bits)))
-
+def _test_cipher(host: str, port: int, cipher_name: str, proto_version, timeout: float):
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
-        with socket.create_connection((host, port), timeout=8.0) as s:
-            with ctx.wrap_socket(s, server_hostname=host) as ss:
-                n, pr, b = ss.cipher()
-                add(n, pr, b or CIPHER_BITS_MAP.get(n, 0))
-        # Liste côté client avec bits réels depuis OpenSSL
-        for c in ctx.get_ciphers():
-            add(c.get("name",""), c.get("protocol",""), c.get("bits") or 0)
-    except: pass
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.minimum_version = proto_version
+            ctx.maximum_version = proto_version
+        except AttributeError:
+            pass
+        ctx.set_ciphers(cipher_name)
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                ss.do_handshake()
+                actual_cipher, proto, bits = ss.cipher()
+                if actual_cipher and actual_cipher.upper() == cipher_name.upper():
+                    return (cipher_name, proto if proto else "TLS", bits)
+    except Exception:
+        pass
+    return None
 
+
+def enumerate_ciphers(host: str, port: int, timeout: float = 10.0) -> List[CipherSuite]:
+    result = []
+    seen = set()
+
+    proto_support = check_protocol_support(host, port, timeout)
+
+    version_map = {}
+    if proto_support.tls13:
+        version_map["TLSv1.3"] = ssl.TLSVersion.TLSv1_3
+    if proto_support.tls12:
+        version_map["TLSv1.2"] = ssl.TLSVersion.TLSv1_2
+    if proto_support.tls11:
+        TLSv1_1 = getattr(ssl.TLSVersion, 'TLSv1_1', None)
+        if TLSv1_1:
+            version_map["TLSv1.1"] = TLSv1_1
+    if proto_support.tls10:
+        TLSv1_0 = getattr(ssl.TLSVersion, 'TLSv1_0', None)
+        if TLSv1_0:
+            version_map["TLSv1.0"] = TLSv1_0
+
+    tasks = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for proto_name, proto_enum in version_map.items():
+            suite_list = CIPHER_SUITES_BY_PROTO.get(proto_name, [])
+            for cipher_name in suite_list:
+                if cipher_name in seen:
+                    continue
+                tasks.append(executor.submit(_test_cipher, host, port, cipher_name, proto_enum, timeout))
+
+        for future in as_completed(tasks):
+            res = future.result()
+            if res and res[0] not in seen:
+                seen.add(res[0])
+                name, proto_label, bits = res
+                bits_final = bits if bits > 0 else CIPHER_BITS_MAP.get(name, 0)
+                strength = _cipher_strength(name, bits_final)
+                result.append(CipherSuite(name=name, protocol=proto_label, bits=bits_final, strength=strength))
+
+    order = {"strong": 0, "acceptable": 1, "weak": 2, "insecure": 3}
+    result.sort(key=lambda c: (order.get(c.strength, 9), c.name))
     return result
 
 
 # ─────────────────────────────────────────
-#  En-têtes de sécurité HTTP
+#  En-têtes de sécurité HTTP (FONCTIONNEL)
 # ─────────────────────────────────────────
 
-def check_security_headers(host: str, port: int) -> SecurityHeaders:
-    hsts = None; hsts_max_age = None; preload = False; subdomains = False
-    url = f"https://{host}/" if port == 443 else f"https://{host}:{port}/"
+def check_security_headers(host: str, port: int, timeout: float = 8.0) -> SecurityHeaders:
+    """Récupère l'en-tête HSTS en suivant jusqu'à 3 redirections HTTPS.
+       Capture l'en-tête sur la première réponse qui le contient, même en cas de redirection ultérieure."""
+    hsts = None
+    hsts_max_age = None
+    preload = False
+    subdomains = False
+
+    current_host = host
+    current_port = port
+    path = "/"
+    max_redirects = 3
+    redirect_count = 0
+
     try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode    = ssl.CERT_NONE
+        while redirect_count <= max_redirects:
+            conn = http.client.HTTPSConnection(current_host, current_port, timeout=timeout)
+            conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            resp = conn.getresponse()
 
-        class _NR(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **kw): return None
+            # Vérifier systématiquement si cette réponse contient HSTS
+            raw = resp.getheader("Strict-Transport-Security")
+            if raw:
+                hsts = raw
+                hsts_max_age = None
+                preload = False
+                subdomains = False
+                for part in [p.strip().lower() for p in raw.split(";")]:
+                    if part.startswith("max-age="):
+                        try: hsts_max_age = int(part.split("=")[1])
+                        except: pass
+                    elif part == "includesubdomains": subdomains = True
+                    elif part == "preload":           preload    = True
 
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(context=ctx), _NR()
-        )
-        req = urllib.request.Request(url, headers={"User-Agent": "SSLScanner/2.0"})
-        raw = None
-        try:
-            with opener.open(req, timeout=8) as resp:
-                raw = resp.headers.get("Strict-Transport-Security")
-        except urllib.error.HTTPError as e:
-            raw = e.headers.get("Strict-Transport-Security")
+            # Si redirection
+            if resp.status in (301, 302, 307, 308):
+                location = resp.getheader("Location")
+                conn.close()
+                if not location:
+                    break
 
-        if raw:
-            hsts = raw
-            for part in [p.strip().lower() for p in raw.split(";")]:
-                if part.startswith("max-age="):
-                    try: hsts_max_age = int(part.split("=")[1])
-                    except: pass
-                elif part == "includesubdomains": subdomains = True
-                elif part == "preload":           preload    = True
-    except: pass
+                if location.startswith("https://"):
+                    parsed = urlparse(location)
+                    current_host = parsed.hostname
+                    current_port = parsed.port if parsed.port else 443
+                    path = parsed.path if parsed.path else "/"
+                    if parsed.query:
+                        path += "?" + parsed.query
+                elif location.startswith("http://"):
+                    break
+                elif location.startswith("/"):
+                    path = location
+                else:
+                    # Chemin relatif
+                    if not path.endswith("/"):
+                        path = path.rsplit("/", 1)[0] + "/"
+                    path = path.rstrip("/") + "/" + location.lstrip("/")
+
+                redirect_count += 1
+                continue
+
+            # Pas de redirection : on sort de la boucle
+            conn.close()
+            break
+
+    except Exception:
+        pass
 
     return SecurityHeaders(hsts=hsts, hsts_max_age=hsts_max_age,
                            hsts_preload=preload, hsts_include_subdomains=subdomains)
-
 
 # ─────────────────────────────────────────
 #  Vulnérabilités
@@ -581,9 +691,10 @@ def check_vulnerabilities(cert: Optional[CertificateInfo],
           "MD5 cryptographiquement cassé depuis 2004", "critical")
         v("Signature SHA-1 (obsolète)", "sha1" in sig and "md5" not in sig,
           "SHA-1 déprécié (RFC 9155)", "medium")
-        v("Clé RSA < 2048 bits",
-          cert.key_type=="RSA" and 0 < cert.key_bits < 2048,
-          f"Clé de {cert.key_bits} bits — minimum recommandé : 2048", "high")
+        if cert.key_type == "RSA" and cert.key_bits > 0:
+            v("Clé RSA < 2048 bits",
+              cert.key_bits < 2048,
+              f"Clé de {cert.key_bits} bits — minimum recommandé : 2048", "high")
 
     return V
 
@@ -615,7 +726,7 @@ def calculate_grade(cert: Optional[CertificateInfo],
         sig = cert.signature_algorithm.lower()
         if "md5"  in sig: ded.append(30)
         elif "sha1" in sig: ded.append(15)
-        if cert.key_type == "RSA":
+        if cert.key_type == "RSA" and cert.key_bits > 0:
             if   cert.key_bits < 1024: ded.append(30)
             elif cert.key_bits < 2048: ded.append(20)
 
@@ -646,9 +757,11 @@ def _resolve_ip(host: str) -> str:
 
 
 class SSLScanner:
-    def __init__(self, timeout: float = 10.0, check_protocols: bool = True):
+    def __init__(self, timeout: float = 10.0, check_protocols: bool = True,
+                 check_headers: bool = True):
         self.timeout = timeout
         self.check_protocols = check_protocols
+        self.check_headers = check_headers
 
     def scan(self, host: str, port: int = 443) -> ScanResult:
         t0 = time.time()
@@ -658,7 +771,7 @@ class SSLScanner:
         st       = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
         cert_info = None; protocols = None; ciphers = []; headers = None
 
-        # ── 1. Certificat ──
+        # 1. Certificat
         try:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
@@ -679,29 +792,32 @@ class SSLScanner:
         except Exception as e:
             errors.append(f"Erreur : {e}")
 
-        # ── 2. Protocoles ──
+        # 2. Protocoles
         if not errors and self.check_protocols:
             try:
-                protocols = check_protocol_support(host, port)
+                protocols = check_protocol_support(host, port, timeout=self.timeout)
                 if protocols.tls10: warnings.append("TLS 1.0 activé — devrait être désactivé")
                 if protocols.tls11: warnings.append("TLS 1.1 activé — devrait être désactivé")
             except Exception as e:
                 warnings.append(f"Détection protocoles partielle : {e}")
 
-        # ── 3. Ciphers ──
-        if not errors:
-            try: ciphers = enumerate_ciphers(host, port)
-            except: pass
-
-        # ── 4. Headers ──
+        # 3. Ciphers (test individuel)
         if not errors:
             try:
-                headers = check_security_headers(host, port)
+                ciphers = enumerate_ciphers(host, port, timeout=self.timeout)
+            except Exception as e:
+                warnings.append(f"Énumération des ciphers impossible : {e}")
+
+        # 4. Headers (HSTS)
+        if not errors and self.check_headers:
+            try:
+                headers = check_security_headers(host, port, timeout=self.timeout)
                 if not headers.hsts:
                     warnings.append("HSTS absent — risque de downgrade HTTP")
-            except: pass
+            except Exception as e:
+                warnings.append(f"Vérification HSTS échouée : {e}")
 
-        # ── 5-6. Vulns & score ──
+        # 5-6. Vulns & score
         vulns = check_vulnerabilities(cert_info, protocols, ciphers)
         grade, score = calculate_grade(cert_info, protocols, ciphers, vulns, headers)
         if errors: grade, score = "N/A", 0
@@ -795,16 +911,19 @@ def print_report(r: ScanResult):
 
 def main():
     import argparse, sys
-    p = argparse.ArgumentParser(description="SSL Scanner v2 — Analyse SSL/TLS")
+    p = argparse.ArgumentParser(description="SSL Scanner v2.2 — Analyse SSL/TLS")
     p.add_argument("hosts", nargs="+")
     p.add_argument("--port","-p",  type=int,   default=443)
     p.add_argument("--json","-j",  action="store_true")
     p.add_argument("--output","-o")
-    p.add_argument("--no-protocols", action="store_true")
+    p.add_argument("--no-protocols", action="store_true", help="Désactiver la vérification des protocoles")
+    p.add_argument("--no-headers",   action="store_true", help="Désactiver la vérification HSTS")
     p.add_argument("--timeout","-t", type=float, default=10.0)
     args = p.parse_args()
 
-    scanner = SSLScanner(timeout=args.timeout, check_protocols=not args.no_protocols)
+    scanner = SSLScanner(timeout=args.timeout,
+                         check_protocols=not args.no_protocols,
+                         check_headers=not args.no_headers)
     results = []
     for host in args.hosts:
         host = re.sub(r"^https?://","", host.strip().rstrip("/")).split("/")[0]

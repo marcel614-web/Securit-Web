@@ -79,10 +79,12 @@
     display: flex;
     gap: 0.75rem;
     align-items: stretch;
+    flex-wrap: wrap;
   }
 
   .input-host {
     flex: 1;
+    min-width: 200px;
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -458,7 +460,7 @@ async function startScan() {
     const resp = await fetch('/api/scan', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ host, port, check_protocols: true })
+      body: JSON.stringify({ host, port, check_protocols: true, check_headers: true })
     });
     clearInterval(interval);
     bar.style.width = '100%';
@@ -486,7 +488,7 @@ async function startScan() {
 
 function showError(msg) {
   const b = document.getElementById('error-banner');
-  b.textContent = '✖ ' + msg;
+  b.textContent = '✖ ' + esc(msg);
   b.style.display = 'block';
 }
 function hideError() {
@@ -514,13 +516,13 @@ function renderResults(d) {
 
   let html = `
   <div class="grade-banner">
-    <div class="grade-circle ${gradeClass(g)}">${g}</div>
+    <div class="grade-circle ${gradeClass(g)}">${esc(g)}</div>
     <div class="grade-info">
-      <h2>${d.host}:${d.port}</h2>
+      <h2>${esc(d.host)}:${d.port}</h2>
       <div class="grade-meta">
-        <span>🌐 ${d.ip_address}</span>
-        <span>⏱ ${d.duration_ms} ms</span>
-        <span>🕒 ${d.scan_time}</span>
+        <span>🌐 ${esc(d.ip_address)}</span>
+        <span>⏱ ${esc(String(d.duration_ms))} ms</span>
+        <span>🕒 ${esc(d.scan_time)}</span>
         <span>Score: <strong>${sc}/100</strong></span>
       </div>
       <div class="score-bar-track">
@@ -532,12 +534,12 @@ function renderResults(d) {
   // Alertes
   if (d.errors && d.errors.length) {
     html += `<div class="card" style="margin-bottom:1rem"><div class="card-title">Erreurs</div><div class="alert-list">`;
-    for (const e of d.errors) html += `<div class="alert-item alert-error">✖ ${e}</div>`;
+    for (const e of d.errors) html += `<div class="alert-item alert-error">✖ ${esc(e)}</div>`;
     html += `</div></div>`;
   }
   if (d.warnings && d.warnings.length) {
     html += `<div class="card" style="margin-bottom:1rem"><div class="card-title">Avertissements</div><div class="alert-list">`;
-    for (const w of d.warnings) html += `<div class="alert-item alert-warn">⚠ ${w}</div>`;
+    for (const w of d.warnings) html += `<div class="alert-item alert-warn">⚠ ${esc(w)}</div>`;
     html += `</div></div>`;
   }
 
@@ -547,12 +549,12 @@ function renderResults(d) {
   if (d.certificate) {
     const c = d.certificate;
     const exp = c.is_expired
-      ? `<span style="color:#ef4444">${c.not_after} (EXPIRÉ)</span>`
+      ? `<span style="color:#ef4444">${esc(c.not_after)} (EXPIRÉ)</span>`
       : c.days_until_expiry < 30
-        ? `<span style="color:#f59e0b">${c.not_after} (${c.days_until_expiry}j)</span>`
-        : `<span style="color:#10b981">${c.not_after} (${c.days_until_expiry}j)</span>`;
+        ? `<span style="color:#f59e0b">${esc(c.not_after)} (${c.days_until_expiry}j)</span>`
+        : `<span style="color:#10b981">${esc(c.not_after)} (${c.days_until_expiry}j)</span>`;
 
-    const san = c.san && c.san.length ? c.san.slice(0,4).join(', ') + (c.san.length>4?` +${c.san.length-4}`:'') : '—';
+    const san = c.san && c.san.length ? c.san.slice(0,4).map(s => esc(s)).join(', ') + (c.san.length>4?` +${c.san.length-4}`:'') : '—';
 
     html += `
     <div class="card">
@@ -563,8 +565,8 @@ function renderResults(d) {
       <div class="cert-row"><span class="cert-label">Version</span><span class="cert-value">v${c.version}</span></div>
       <div class="cert-row"><span class="cert-label">Valide jusqu'au</span><span class="cert-value">${exp}</span></div>
       <div class="cert-row"><span class="cert-label">Auto-signé</span><span class="cert-value" style="color:${c.is_self_signed?'#ef4444':'#10b981'}">${c.is_self_signed?'OUI':'non'}</span></div>
-      <div class="cert-row"><span class="cert-label">SAN</span><span class="cert-value" style="font-size:0.7rem">${esc(san)}</span></div>
-      <div class="cert-row"><span class="cert-label">SHA-256</span><span class="cert-value" style="font-size:0.62rem;color:#64748b">${c.fingerprint_sha256.substring(0,29)}…</span></div>
+      <div class="cert-row"><span class="cert-label">SAN</span><span class="cert-value" style="font-size:0.7rem">${san}</span></div>
+      <div class="cert-row"><span class="cert-label">SHA-256</span><span class="cert-value" style="font-size:0.62rem;color:#64748b">${esc(c.fingerprint_sha256.substring(0,29))}…</span></div>
     </div>`;
   }
 
@@ -591,7 +593,7 @@ function renderResults(d) {
       } else {
         badge = '✖ Non supporté'; badgeClass = 'badge-off';
       }
-      html += `<div class="proto-item"><span class="proto-name">${proto.name}</span><span class="badge ${badgeClass}">${badge}</span></div>`;
+      html += `<div class="proto-item"><span class="proto-name">${esc(proto.name)}</span><span class="badge ${badgeClass}">${badge}</span></div>`;
     }
     html += `</div></div>`;
   }
@@ -671,12 +673,13 @@ function renderResults(d) {
 }
 
 function esc(str) {
-  if (!str) return '';
+  if (str === undefined || str === null) return '';
   return String(str)
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;');
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 async function loadHistory() {
@@ -690,8 +693,8 @@ async function loadHistory() {
     grid.innerHTML = data.map(item => {
       const col = gradeColorMap[item.grade] || '#64748b';
       return `<div class="history-chip" onclick="quickScan('${esc(item.host)}')">
-        <span class="h-grade" style="color:${col}">${item.grade}</span>
-        <span>${esc(item.host)}</span>
+        <span class="h-grade" style="color:${col}">${esc(item.grade)}</span>
+        <span>${esc(item.host)}:${item.port}</span>
       </div>`;
     }).join('');
     sec.style.display = 'block';
