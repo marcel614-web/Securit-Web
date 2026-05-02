@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-SSL Scanner v2.2 – Analyse SSL/TLS professionnelle
-Cipher suites : test individuel par suite (multi-thread)
-HSTS : http.client avec suivi manuel des redirections (changement d'hôte géré)
+SSL Scanner v2.4 – Analyse SSL/TLS professionnelle
+Fonctionnalités :
+  - Scan complet : certificat, protocoles, ciphers, HSTS, vulnérabilités
+  - Enregistrement / chargement JSON et texte
+  - Export PDF (nécessite pdf_generator.py + fpdf2)
 """
 
 import ssl
@@ -14,6 +16,7 @@ import time
 import re
 import warnings
 import http.client
+import sys
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -45,7 +48,6 @@ class CertificateInfo:
     key_type: str
     key_bits: int
 
-
 @dataclass
 class ProtocolSupport:
     ssl2: bool
@@ -55,14 +57,12 @@ class ProtocolSupport:
     tls12: bool
     tls13: bool
 
-
 @dataclass
 class CipherSuite:
     name: str
     protocol: str
     bits: int
     strength: str
-
 
 @dataclass
 class SecurityHeaders:
@@ -71,14 +71,12 @@ class SecurityHeaders:
     hsts_preload: bool
     hsts_include_subdomains: bool
 
-
 @dataclass
 class VulnerabilityCheck:
     name: str
     vulnerable: bool
     description: str
     severity: str
-
 
 @dataclass
 class ScanResult:
@@ -99,7 +97,7 @@ class ScanResult:
 
 
 # ─────────────────────────────────────────
-#  Liste des suites connues par protocole
+#  Suites connues (optimisées)
 # ─────────────────────────────────────────
 
 CIPHER_SUITES_BY_PROTO = {
@@ -107,65 +105,15 @@ CIPHER_SUITES_BY_PROTO = {
         "TLS_AES_256_GCM_SHA384",
         "TLS_AES_128_GCM_SHA256",
         "TLS_CHACHA20_POLY1305_SHA256",
-        "TLS_AES_128_CCM_SHA256",
-        "TLS_AES_128_CCM_8_SHA256",
     ],
     "TLSv1.2": [
         "ECDHE-ECDSA-AES256-GCM-SHA384",
         "ECDHE-ECDSA-AES128-GCM-SHA256",
-        "ECDHE-ECDSA-CHACHA20-POLY1305",
         "ECDHE-RSA-AES256-GCM-SHA384",
         "ECDHE-RSA-AES128-GCM-SHA256",
         "ECDHE-RSA-CHACHA20-POLY1305",
-        "DHE-RSA-AES256-GCM-SHA384",
-        "DHE-RSA-AES128-GCM-SHA256",
-        "DHE-RSA-CHACHA20-POLY1305",
         "AES256-GCM-SHA384",
         "AES128-GCM-SHA256",
-        "AES256-SHA256",
-        "AES128-SHA256",
-        "AES256-SHA",
-        "AES128-SHA",
-        "DES-CBC3-SHA",
-        "RC4-SHA",
-        "RC4-MD5",
-        "NULL-SHA",
-        "NULL-MD5",
-    ],
-    "TLSv1.1": [
-        "ECDHE-ECDSA-AES256-SHA",
-        "ECDHE-ECDSA-AES128-SHA",
-        "ECDHE-RSA-AES256-SHA",
-        "ECDHE-RSA-AES128-SHA",
-        "DHE-RSA-AES256-SHA",
-        "DHE-RSA-AES128-SHA",
-        "AES256-SHA",
-        "AES128-SHA",
-        "DES-CBC3-SHA",
-        "RC4-SHA",
-        "RC4-MD5",
-    ],
-    "TLSv1.0": [
-        "ECDHE-ECDSA-AES256-SHA",
-        "ECDHE-ECDSA-AES128-SHA",
-        "ECDHE-RSA-AES256-SHA",
-        "ECDHE-RSA-AES128-SHA",
-        "DHE-RSA-AES256-SHA",
-        "DHE-RSA-AES128-SHA",
-        "AES256-SHA",
-        "AES128-SHA",
-        "DES-CBC3-SHA",
-        "RC4-SHA",
-        "RC4-MD5",
-    ],
-    "SSLv3": [
-        "AES256-SHA",
-        "AES128-SHA",
-        "DES-CBC3-SHA",
-        "RC4-SHA",
-        "RC4-MD5",
-        "NULL-SHA",
-        "NULL-MD5",
     ],
 }
 
@@ -173,56 +121,17 @@ CIPHER_BITS_MAP: Dict[str, int] = {
     "TLS_AES_256_GCM_SHA384": 256,
     "TLS_AES_128_GCM_SHA256": 128,
     "TLS_CHACHA20_POLY1305_SHA256": 256,
-    "TLS_AES_128_CCM_SHA256": 128,
-    "TLS_AES_128_CCM_8_SHA256": 128,
     "ECDHE-ECDSA-AES256-GCM-SHA384": 256,
     "ECDHE-ECDSA-AES128-GCM-SHA256": 128,
-    "ECDHE-ECDSA-CHACHA20-POLY1305": 256,
-    "ECDHE-ECDSA-AES256-SHA384": 256,
-    "ECDHE-ECDSA-AES128-SHA256": 128,
-    "ECDHE-ECDSA-AES256-SHA": 256,
-    "ECDHE-ECDSA-AES128-SHA": 128,
-    "ECDHE-ECDSA-DES-CBC3-SHA": 112,
     "ECDHE-RSA-AES256-GCM-SHA384": 256,
     "ECDHE-RSA-AES128-GCM-SHA256": 128,
     "ECDHE-RSA-CHACHA20-POLY1305": 256,
-    "ECDHE-RSA-AES256-SHA384": 256,
-    "ECDHE-RSA-AES128-SHA256": 128,
-    "ECDHE-RSA-AES256-SHA": 256,
-    "ECDHE-RSA-AES128-SHA": 128,
-    "ECDHE-RSA-DES-CBC3-SHA": 112,
-    "ECDHE-RSA-RC4-SHA": 128,
-    "DHE-RSA-AES256-GCM-SHA384": 256,
-    "DHE-RSA-AES128-GCM-SHA256": 128,
-    "DHE-RSA-CHACHA20-POLY1305": 256,
-    "DHE-RSA-AES256-SHA256": 256,
-    "DHE-RSA-AES128-SHA256": 128,
-    "DHE-RSA-AES256-SHA": 256,
-    "DHE-RSA-AES128-SHA": 128,
-    "DHE-RSA-DES-CBC3-SHA": 112,
-    "DHE-DSS-AES256-GCM-SHA384": 256,
-    "DHE-DSS-AES128-GCM-SHA256": 128,
-    "DHE-DSS-AES256-SHA256": 256,
-    "DHE-DSS-AES128-SHA256": 128,
-    "DHE-DSS-AES256-SHA": 256,
-    "DHE-DSS-AES128-SHA": 128,
     "AES256-GCM-SHA384": 256,
     "AES128-GCM-SHA256": 128,
-    "AES256-SHA256": 256,
-    "AES128-SHA256": 128,
-    "AES256-SHA": 256,
-    "AES128-SHA": 128,
-    "DES-CBC3-SHA": 112,
-    "RC4-SHA": 128,
-    "RC4-MD5": 128,
-    "NULL-SHA": 0,
-    "NULL-MD5": 0,
-    "EXP-RC4-MD5": 40,
-    "EXP-DES-CBC-SHA": 40,
 }
 
-INSECURE_KW = ["NULL", "EXP-", "EXPORT", "ANON", "ANULL", "ENULL", "RC4", "RC2", "IDEA"]
-WEAK_KW     = ["DES-CBC3", "3DES", "DES-CBC-", "SEED"]
+INSECURE_KW = ["NULL", "EXP-", "EXPORT", "ANON", "RC4", "RC2", "IDEA"]
+WEAK_KW     = ["DES-CBC3", "3DES"]
 
 
 def _cipher_strength(name: str, bits: int) -> str:
@@ -243,7 +152,7 @@ def _cipher_strength(name: str, bits: int) -> str:
 
 
 # ─────────────────────────────────────────
-#  Parseur ASN.1 DER (complet)
+#  Parseur ASN.1 DER (inchangé)
 # ─────────────────────────────────────────
 
 class _DER:
@@ -469,10 +378,10 @@ def analyze_certificate(der: bytes) -> CertificateInfo:
 
 
 # ─────────────────────────────────────────
-#  Détection des protocoles
+#  Protocoles
 # ─────────────────────────────────────────
 
-def _try_tls(host: str, port: int, minv, maxv, timeout: float = 5.0) -> bool:
+def _try_tls(host, port, minv, maxv, timeout=5.0):
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
@@ -486,28 +395,24 @@ def _try_tls(host: str, port: int, minv, maxv, timeout: float = 5.0) -> bool:
             with ctx.wrap_socket(s, server_hostname=host) as ss:
                 ss.do_handshake()
                 return True
-    except: return False
+    except:
+        return False
 
-
-def check_protocol_support(host: str, port: int, timeout: float = 10.0) -> ProtocolSupport:
+def check_protocol_support(host, port, timeout=10.0):
     tls13 = _try_tls(host, port, ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_3, timeout)
     tls12 = _try_tls(host, port, ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_2, timeout)
-
     TLSv1_1 = getattr(ssl.TLSVersion, 'TLSv1_1', None)
     tls11 = _try_tls(host, port, TLSv1_1, TLSv1_1, timeout) if TLSv1_1 else False
-
     TLSv1_0 = getattr(ssl.TLSVersion, 'TLSv1_0', None)
     tls10 = _try_tls(host, port, TLSv1_0, TLSv1_0, timeout) if TLSv1_0 else False
-
-    return ProtocolSupport(ssl2=False, ssl3=False,
-                           tls10=tls10, tls11=tls11, tls12=tls12, tls13=tls13)
+    return ProtocolSupport(ssl2=False, ssl3=False, tls10=tls10, tls11=tls11, tls12=tls12, tls13=tls13)
 
 
 # ─────────────────────────────────────────
-#  Énumération des suites (test individuel)
+#  Énumération des suites
 # ─────────────────────────────────────────
 
-def _test_cipher(host: str, port: int, cipher_name: str, proto_version, timeout: float):
+def _test_cipher(host, port, cipher_name, proto_version, timeout):
     try:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
@@ -524,15 +429,13 @@ def _test_cipher(host: str, port: int, cipher_name: str, proto_version, timeout:
                 actual_cipher, proto, bits = ss.cipher()
                 if actual_cipher and actual_cipher.upper() == cipher_name.upper():
                     return (cipher_name, proto if proto else "TLS", bits)
-    except Exception:
+    except:
         pass
     return None
-
 
 def enumerate_ciphers(host: str, port: int, timeout: float = 10.0) -> List[CipherSuite]:
     result = []
     seen = set()
-
     proto_support = check_protocol_support(host, port, timeout)
 
     version_map = {}
@@ -540,23 +443,16 @@ def enumerate_ciphers(host: str, port: int, timeout: float = 10.0) -> List[Ciphe
         version_map["TLSv1.3"] = ssl.TLSVersion.TLSv1_3
     if proto_support.tls12:
         version_map["TLSv1.2"] = ssl.TLSVersion.TLSv1_2
-    if proto_support.tls11:
-        TLSv1_1 = getattr(ssl.TLSVersion, 'TLSv1_1', None)
-        if TLSv1_1:
-            version_map["TLSv1.1"] = TLSv1_1
-    if proto_support.tls10:
-        TLSv1_0 = getattr(ssl.TLSVersion, 'TLSv1_0', None)
-        if TLSv1_0:
-            version_map["TLSv1.0"] = TLSv1_0
 
     tasks = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    ciph_timeout = 2.0
+    with ThreadPoolExecutor(max_workers=8) as executor:
         for proto_name, proto_enum in version_map.items():
             suite_list = CIPHER_SUITES_BY_PROTO.get(proto_name, [])
             for cipher_name in suite_list:
                 if cipher_name in seen:
                     continue
-                tasks.append(executor.submit(_test_cipher, host, port, cipher_name, proto_enum, timeout))
+                tasks.append(executor.submit(_test_cipher, host, port, cipher_name, proto_enum, ciph_timeout))
 
         for future in as_completed(tasks):
             res = future.result()
@@ -573,12 +469,10 @@ def enumerate_ciphers(host: str, port: int, timeout: float = 10.0) -> List[Ciphe
 
 
 # ─────────────────────────────────────────
-#  En-têtes de sécurité HTTP (FONCTIONNEL)
+#  En-têtes de sécurité HTTP (HSTS)
 # ─────────────────────────────────────────
 
 def check_security_headers(host: str, port: int, timeout: float = 8.0) -> SecurityHeaders:
-    """Récupère l'en-tête HSTS en suivant jusqu'à 3 redirections HTTPS.
-       Capture l'en-tête sur la première réponse qui le contient, même en cas de redirection ultérieure."""
     hsts = None
     hsts_max_age = None
     preload = False
@@ -593,10 +487,9 @@ def check_security_headers(host: str, port: int, timeout: float = 8.0) -> Securi
     try:
         while redirect_count <= max_redirects:
             conn = http.client.HTTPSConnection(current_host, current_port, timeout=timeout)
-            conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0"})
             resp = conn.getresponse()
 
-            # Vérifier systématiquement si cette réponse contient HSTS
             raw = resp.getheader("Strict-Transport-Security")
             if raw:
                 hsts = raw
@@ -610,7 +503,6 @@ def check_security_headers(host: str, port: int, timeout: float = 8.0) -> Securi
                     elif part == "includesubdomains": subdomains = True
                     elif part == "preload":           preload    = True
 
-            # Si redirection
             if resp.status in (301, 302, 307, 308):
                 location = resp.getheader("Location")
                 conn.close()
@@ -629,7 +521,6 @@ def check_security_headers(host: str, port: int, timeout: float = 8.0) -> Securi
                 elif location.startswith("/"):
                     path = location
                 else:
-                    # Chemin relatif
                     if not path.endswith("/"):
                         path = path.rsplit("/", 1)[0] + "/"
                     path = path.rstrip("/") + "/" + location.lstrip("/")
@@ -637,7 +528,6 @@ def check_security_headers(host: str, port: int, timeout: float = 8.0) -> Securi
                 redirect_count += 1
                 continue
 
-            # Pas de redirection : on sort de la boucle
             conn.close()
             break
 
@@ -647,13 +537,12 @@ def check_security_headers(host: str, port: int, timeout: float = 8.0) -> Securi
     return SecurityHeaders(hsts=hsts, hsts_max_age=hsts_max_age,
                            hsts_preload=preload, hsts_include_subdomains=subdomains)
 
+
 # ─────────────────────────────────────────
 #  Vulnérabilités
 # ─────────────────────────────────────────
 
-def check_vulnerabilities(cert: Optional[CertificateInfo],
-                          proto: Optional[ProtocolSupport],
-                          ciphers: List[CipherSuite]) -> List[VulnerabilityCheck]:
+def check_vulnerabilities(cert, proto, ciphers):
     V = []
     def v(name, vuln, desc, sev): V.append(VulnerabilityCheck(name, vuln, desc, sev))
 
@@ -695,7 +584,6 @@ def check_vulnerabilities(cert: Optional[CertificateInfo],
             v("Clé RSA < 2048 bits",
               cert.key_bits < 2048,
               f"Clé de {cert.key_bits} bits — minimum recommandé : 2048", "high")
-
     return V
 
 
@@ -703,44 +591,33 @@ def check_vulnerabilities(cert: Optional[CertificateInfo],
 #  Score et note
 # ─────────────────────────────────────────
 
-def calculate_grade(cert: Optional[CertificateInfo],
-                    proto: Optional[ProtocolSupport],
-                    ciphers: List[CipherSuite],
-                    vulns: List[VulnerabilityCheck],
-                    headers: Optional[SecurityHeaders]) -> Tuple[str, int]:
+def calculate_grade(cert, proto, ciphers, vulns, headers):
     score = 100
-    ded   = []
-
+    ded = []
     if proto:
-        if proto.ssl2:  ded.append(40)
-        if proto.ssl3:  ded.append(20)
+        if proto.ssl2: ded.append(40)
+        if proto.ssl3: ded.append(20)
         if proto.tls10: ded.append(10)
         if proto.tls11: ded.append(5)
         if not proto.tls12 and not proto.tls13: ded.append(30)
-
     if cert:
-        if cert.is_expired:               ded.append(50)
-        elif cert.days_until_expiry <  7: ded.append(25)
+        if cert.is_expired: ded.append(50)
+        elif cert.days_until_expiry < 7: ded.append(25)
         elif cert.days_until_expiry < 30: ded.append(10)
-        if cert.is_self_signed:           ded.append(25)
+        if cert.is_self_signed: ded.append(25)
         sig = cert.signature_algorithm.lower()
-        if "md5"  in sig: ded.append(30)
+        if "md5" in sig: ded.append(30)
         elif "sha1" in sig: ded.append(15)
         if cert.key_type == "RSA" and cert.key_bits > 0:
-            if   cert.key_bits < 1024: ded.append(30)
+            if cert.key_bits < 1024: ded.append(30)
             elif cert.key_bits < 2048: ded.append(20)
-
     ded.append(min(sum(1 for c in ciphers if c.strength=="insecure")*5, 20))
-    ded.append(min(sum(1 for c in ciphers if c.strength=="weak")*2,     10))
-
+    ded.append(min(sum(1 for c in ciphers if c.strength=="weak")*2, 10))
     for vv in vulns:
         if vv.vulnerable and vv.severity == "critical": ded.append(25)
-
-    if proto and proto.tls13:
-        score = min(score + 3, 100)
+    if proto and proto.tls13: score = min(score + 3, 100)
     if headers and headers.hsts and headers.hsts_max_age and headers.hsts_max_age >= 31536000:
         score = min(score + 5, 100)
-
     score = max(0, score - sum(ded))
     grade = ("A+" if score>=95 else "A" if score>=85 else "B" if score>=75 else
              "C"  if score>=65 else "D" if score>=50 else "E" if score>=30 else "F")
@@ -755,23 +632,21 @@ def _resolve_ip(host: str) -> str:
     try: return socket.gethostbyname(host)
     except: return "N/A"
 
-
 class SSLScanner:
-    def __init__(self, timeout: float = 10.0, check_protocols: bool = True,
-                 check_headers: bool = True):
+    def __init__(self, timeout=10.0, check_protocols=True, check_headers=True):
         self.timeout = timeout
         self.check_protocols = check_protocols
         self.check_headers = check_headers
 
-    def scan(self, host: str, port: int = 443) -> ScanResult:
+    def scan(self, host, port=443):
         t0 = time.time()
-        errors: List[str] = []
-        warnings: List[str] = []
-        ip       = _resolve_ip(host)
-        st       = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-        cert_info = None; protocols = None; ciphers = []; headers = None
+        errors, warnings = [], []
+        ip = _resolve_ip(host)
+        st = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        cert_info = protocols = headers = None
+        ciphers = []
 
-        # 1. Certificat
+        # Certificat
         try:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
@@ -781,43 +656,31 @@ class SSLScanner:
                     der = ss.getpeercert(binary_form=True)
                     if der:
                         cert_info = analyze_certificate(der)
-        except socket.timeout:
-            errors.append(f"Timeout ({self.timeout}s) — hôte injoignable")
-        except ConnectionRefusedError:
-            errors.append(f"Connexion refusée sur {host}:{port}")
-        except ssl.SSLError as e:
-            errors.append(f"Erreur SSL : {e}")
-        except socket.gaierror:
-            errors.append(f"Résolution DNS impossible : {host}")
-        except Exception as e:
-            errors.append(f"Erreur : {e}")
+        except socket.timeout: errors.append(f"Timeout ({self.timeout}s)")
+        except ConnectionRefusedError: errors.append(f"Connexion refusée sur {host}:{port}")
+        except ssl.SSLError as e: errors.append(f"Erreur SSL : {e}")
+        except socket.gaierror: errors.append(f"Résolution DNS impossible : {host}")
+        except Exception as e: errors.append(f"Erreur : {e}")
 
-        # 2. Protocoles
         if not errors and self.check_protocols:
             try:
                 protocols = check_protocol_support(host, port, timeout=self.timeout)
-                if protocols.tls10: warnings.append("TLS 1.0 activé — devrait être désactivé")
-                if protocols.tls11: warnings.append("TLS 1.1 activé — devrait être désactivé")
-            except Exception as e:
-                warnings.append(f"Détection protocoles partielle : {e}")
+                if protocols.tls10: warnings.append("TLS 1.0 activé")
+                if protocols.tls11: warnings.append("TLS 1.1 activé")
+            except Exception as e: warnings.append(f"Protocoles partiels : {e}")
 
-        # 3. Ciphers (test individuel)
         if not errors:
             try:
                 ciphers = enumerate_ciphers(host, port, timeout=self.timeout)
-            except Exception as e:
-                warnings.append(f"Énumération des ciphers impossible : {e}")
+            except Exception as e: warnings.append(f"Ciphers impossibles : {e}")
 
-        # 4. Headers (HSTS)
         if not errors and self.check_headers:
             try:
                 headers = check_security_headers(host, port, timeout=self.timeout)
                 if not headers.hsts:
                     warnings.append("HSTS absent — risque de downgrade HTTP")
-            except Exception as e:
-                warnings.append(f"Vérification HSTS échouée : {e}")
+            except Exception as e: warnings.append(f"HSTS échoué : {e}")
 
-        # 5-6. Vulns & score
         vulns = check_vulnerabilities(cert_info, protocols, ciphers)
         grade, score = calculate_grade(cert_info, protocols, ciphers, vulns, headers)
         if errors: grade, score = "N/A", 0
@@ -837,72 +700,122 @@ class SSLScanner:
 
 
 # ─────────────────────────────────────────
+#  Fonctions d'enregistrement et de chargement
+# ─────────────────────────────────────────
+
+def save_scan_to_file(result: ScanResult, filename: str) -> None:
+    """Enregistre un ScanResult dans un fichier JSON."""
+    data = asdict(result)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+
+def load_scan_from_file(filename: str) -> Optional[ScanResult]:
+    """Charge un ScanResult depuis un fichier JSON."""
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Erreur lors du chargement du fichier : {e}", file=sys.stderr)
+        return None
+
+    # Conversion du dictionnaire en dataclasses
+    def _dict_to_dataclass(cls, d):
+        if d is None: return None
+        try:
+            if cls == CertificateInfo: return CertificateInfo(**d)
+            if cls == ProtocolSupport: return ProtocolSupport(**d)
+            if cls == SecurityHeaders: return SecurityHeaders(**d)
+            if cls == CipherSuite: return CipherSuite(**d)
+            if cls == VulnerabilityCheck: return VulnerabilityCheck(**d)
+        except: return None
+
+    cert = _dict_to_dataclass(CertificateInfo, data.get("certificate"))
+    proto = _dict_to_dataclass(ProtocolSupport, data.get("protocol_support"))
+    headers = _dict_to_dataclass(SecurityHeaders, data.get("security_headers"))
+    ciphers = [cs for cs in (_dict_to_dataclass(CipherSuite, cs) for cs in data.get("cipher_suites", [])) if cs]
+    vulns = [v for v in (_dict_to_dataclass(VulnerabilityCheck, v) for v in data.get("vulnerabilities", [])) if v]
+
+    return ScanResult(
+        host=data.get("host", "?"),
+        port=data.get("port", 443),
+        ip_address=data.get("ip_address", "N/A"),
+        scan_time=data.get("scan_time", "N/A"),
+        duration_ms=data.get("duration_ms", 0.0),
+        grade=data.get("grade", "N/A"),
+        score=data.get("score", 0),
+        certificate=cert,
+        protocol_support=proto,
+        cipher_suites=ciphers,
+        security_headers=headers,
+        vulnerabilities=vulns,
+        errors=data.get("errors", []),
+        warnings=data.get("warnings", [])
+    )
+
+
+# ─────────────────────────────────────────
 #  Rapport console
 # ─────────────────────────────────────────
 
-def print_report(r: ScanResult):
+def print_report(r: ScanResult, file=sys.stdout):
+    """Affiche le rapport, peut être redirigé vers un fichier."""
     C = {"reset":"\033[0m","bold":"\033[1m","red":"\033[91m","green":"\033[92m",
          "yellow":"\033[93m","cyan":"\033[96m","gray":"\033[90m"}
+    if not file.isatty():
+        for k in C: C[k] = ""
     def c(col,txt): return f"{C.get(col,'')}{txt}{C['reset']}"
     GC={"A+":"green","A":"green","B":"cyan","C":"yellow","D":"yellow","E":"red","F":"red","N/A":"gray"}
 
-    print("\n"+"═"*64)
-    print(c("bold",f"  SSL SCAN — {r.host}:{r.port}"))
-    print("═"*64)
-    print(f"  IP     : {r.ip_address}")
-    print(f"  Scan   : {r.scan_time}  ({r.duration_ms} ms)")
-    print(f"  Note   : {c(GC.get(r.grade,'gray'),c('bold',r.grade))}   Score : {r.score}/100")
-
-    for e in r.errors:   print(f"\n  {c('red','✖')} {e}")
-    for w in r.warnings: print(f"  {c('yellow','⚠')} {w}")
-
+    print("\n"+"═"*64, file=file)
+    print(c("bold",f"  SSL SCAN — {r.host}:{r.port}"), file=file)
+    print("═"*64, file=file)
+    print(f"  IP     : {r.ip_address}", file=file)
+    print(f"  Scan   : {r.scan_time}  ({r.duration_ms} ms)", file=file)
+    print(f"  Note   : {c(GC.get(r.grade,'gray'),c('bold',r.grade))}   Score : {r.score}/100", file=file)
+    for e in r.errors:   print(f"\n  {c('red','✖')} {e}", file=file)
+    for w in r.warnings: print(f"  {c('yellow','⚠')} {w}", file=file)
     if r.certificate:
         ct = r.certificate
         ec = "red" if ct.is_expired else ("yellow" if ct.days_until_expiry<30 else "green")
-        print(f"\n{c('bold','  CERTIFICAT')}")
-        print(f"    CN           : {ct.subject.get('CN','N/A')}")
-        print(f"    Organisation : {ct.subject.get('O','N/A')}")
-        print(f"    Émetteur     : {ct.issuer.get('O',ct.issuer.get('CN','N/A'))}")
-        print(f"    Algo. sign.  : {ct.signature_algorithm}")
-        print(f"    Clé          : {ct.key_type} {ct.key_bits} bits")
-        print(f"    Expire       : {c(ec,ct.not_after)}  ({ct.days_until_expiry}j)")
-        print(f"    Auto-signé   : {c('red','OUI') if ct.is_self_signed else 'non'}")
-        if ct.san: print(f"    SAN          : {', '.join(ct.san[:5])}"+(f"  +{len(ct.san)-5}"if len(ct.san)>5 else""))
-
+        print(f"\n{c('bold','  CERTIFICAT')}", file=file)
+        print(f"    CN           : {ct.subject.get('CN','N/A')}", file=file)
+        print(f"    Organisation : {ct.subject.get('O','N/A')}", file=file)
+        print(f"    Émetteur     : {ct.issuer.get('O',ct.issuer.get('CN','N/A'))}", file=file)
+        print(f"    Algo. sign.  : {ct.signature_algorithm}", file=file)
+        print(f"    Clé          : {ct.key_type} {ct.key_bits} bits", file=file)
+        print(f"    Expire       : {c(ec,ct.not_after)}  ({ct.days_until_expiry}j)", file=file)
+        print(f"    Auto-signé   : {c('red','OUI') if ct.is_self_signed else 'non'}", file=file)
+        if ct.san: print(f"    SAN          : {', '.join(ct.san[:5])}"+(f"  +{len(ct.san)-5}"if len(ct.san)>5 else""), file=file)
     if r.protocol_support:
         p=r.protocol_support
-        print(f"\n{c('bold','  PROTOCOLES')}")
+        print(f"\n{c('bold','  PROTOCOLES')}", file=file)
         for nm,ok,bad in [("SSLv2",p.ssl2,True),("SSLv3",p.ssl3,True),
                            ("TLS 1.0",p.tls10,True),("TLS 1.1",p.tls11,True),
                            ("TLS 1.2",p.tls12,False),("TLS 1.3",p.tls13,False)]:
             col="red"if(ok and bad)else"green"if(not ok and bad)or(ok and not bad)else"gray"
-            print(f"    {nm:<10}: {c(col,'✔ activé' if ok else '✖ inactif')}")
-
+            print(f"    {nm:<10}: {c(col,'✔ activé' if ok else '✖ inactif')}", file=file)
     if r.cipher_suites:
         SC={"strong":"green","acceptable":"cyan","weak":"yellow","insecure":"red"}
-        print(f"\n{c('bold','  CIPHER SUITES (top 8)')}")
+        print(f"\n{c('bold','  CIPHER SUITES (top 8)')}", file=file)
         for cs in r.cipher_suites[:8]:
-            print(f"    {c(SC.get(cs.strength,'gray'),'●')} {cs.name:<46}{cs.bits:>4} bits  [{cs.strength}]")
-
+            print(f"    {c(SC.get(cs.strength,'gray'),'●')} {cs.name:<46}{cs.bits:>4} bits  [{cs.strength}]", file=file)
     if r.vulnerabilities:
         SC2={"critical":"red","high":"red","medium":"yellow","low":"cyan","info":"gray"}
-        print(f"\n{c('bold','  VULNÉRABILITÉS')}")
+        print(f"\n{c('bold','  VULNÉRABILITÉS')}", file=file)
         for vv in r.vulnerabilities:
             col=SC2.get(vv.severity,"gray") if vv.vulnerable else "green"
-            print(f"    {c(col,'✖' if vv.vulnerable else '✔')} [{vv.severity.upper():<8}] {vv.name}")
-            if vv.vulnerable: print(f"         {c('gray',vv.description)}")
-
+            print(f"    {c(col,'✖' if vv.vulnerable else '✔')} [{vv.severity.upper():<8}] {vv.name}", file=file)
+            if vv.vulnerable: print(f"         {c('gray',vv.description)}", file=file)
     if r.security_headers:
         h=r.security_headers
-        print(f"\n{c('bold','  SÉCURITÉ HTTP')}")
+        print(f"\n{c('bold','  SÉCURITÉ HTTP')}", file=file)
         if h.hsts:
-            print(f"    HSTS             : {c('green','✔ activé')}  max-age={h.hsts_max_age}")
-            print(f"    includeSubDomains: {'✔' if h.hsts_include_subdomains else '✖'}")
-            print(f"    preload          : {'✔' if h.hsts_preload else '✖'}")
+            print(f"    HSTS             : {c('green','✔ activé')}  max-age={h.hsts_max_age}", file=file)
+            print(f"    includeSubDomains: {'✔' if h.hsts_include_subdomains else '✖'}", file=file)
+            print(f"    preload          : {'✔' if h.hsts_preload else '✖'}", file=file)
         else:
-            print(f"    HSTS             : {c('red','✖ absent')}")
-
-    print("\n"+"═"*64+"\n")
+            print(f"    HSTS             : {c('red','✖ absent')}", file=file)
+    print("\n"+"═"*64+"\n", file=file)
 
 
 # ─────────────────────────────────────────
@@ -911,15 +824,33 @@ def print_report(r: ScanResult):
 
 def main():
     import argparse, sys
-    p = argparse.ArgumentParser(description="SSL Scanner v2.2 — Analyse SSL/TLS")
-    p.add_argument("hosts", nargs="+")
-    p.add_argument("--port","-p",  type=int,   default=443)
-    p.add_argument("--json","-j",  action="store_true")
-    p.add_argument("--output","-o")
-    p.add_argument("--no-protocols", action="store_true", help="Désactiver la vérification des protocoles")
-    p.add_argument("--no-headers",   action="store_true", help="Désactiver la vérification HSTS")
+    p = argparse.ArgumentParser(description="SSL Scanner v2.4 — Analyse SSL/TLS avec sauvegarde/chargement et PDF")
+    p.add_argument("hosts", nargs="*", help="Noms d'hôte à scanner (ignoré si --load)")
+    p.add_argument("--port","-p", type=int, default=443)
+    p.add_argument("--json","-j", action="store_true", help="Sortie JSON uniquement")
+    p.add_argument("--output","-o", help="Sauvegarde JSON (identique à --save-json)")
+    p.add_argument("--save-json", help="Sauvegarde JSON explicite")
+    p.add_argument("--save-text", help="Sauvegarde du rapport texte")
+    p.add_argument("--load", help="Charge un scan précédent depuis un fichier JSON et l'affiche")
+    p.add_argument("--pdf", help="Sauvegarde du rapport PDF (nécessite pdf_generator.py et fpdf2)")
+    p.add_argument("--no-protocols", action="store_true")
+    p.add_argument("--no-headers", action="store_true")
     p.add_argument("--timeout","-t", type=float, default=10.0)
     args = p.parse_args()
+
+    # Mode chargement
+    if args.load:
+        result = load_scan_from_file(args.load)
+        if result:
+            print_report(result)
+        else:
+            print("Impossible de charger le fichier.", file=sys.stderr)
+        return
+
+    # Sinon, il faut au moins un hôte
+    if not args.hosts:
+        p.print_help()
+        sys.exit(1)
 
     scanner = SSLScanner(timeout=args.timeout,
                          check_protocols=not args.no_protocols,
@@ -929,15 +860,35 @@ def main():
         host = re.sub(r"^https?://","", host.strip().rstrip("/")).split("/")[0]
         print(f"\n[*] Scan de {host}:{args.port} …", file=sys.stderr)
         r = scanner.scan(host, args.port)
-        if args.json or args.output: results.append(asdict(r))
-        else: print_report(r)
+        results.append(r)
 
-    if args.json or args.output:
-        out = json.dumps(results[0] if len(results)==1 else results, indent=2, default=str)
-        if args.output:
-            with open(args.output,"w") as f: f.write(out)
-            print(f"[+] Sauvegardé dans {args.output}", file=sys.stderr)
-        else: print(out)
+    # Sauvegarde/affichage
+    for i, r in enumerate(results):
+        json_file = args.output if i==0 else None
+        if args.save_json and i==0:
+            json_file = args.save_json
+
+        if json_file:
+            save_scan_to_file(r, json_file)
+            print(f"[+] Scan JSON sauvegardé dans {json_file}", file=sys.stderr)
+
+        if args.save_text and i==0:
+            with open(args.save_text, "w", encoding="utf-8") as f:
+                print_report(r, file=f)
+            print(f"[+] Rapport texte sauvegardé dans {args.save_text}", file=sys.stderr)
+
+        if args.pdf and i==0:
+            try:
+                from pdf_generator import generate_pdf_report
+                generate_pdf_report(r, args.pdf)
+                print(f"[+] Rapport PDF sauvegardé dans {args.pdf}", file=sys.stderr)
+            except ImportError:
+                print("Erreur : module pdf_generator ou fpdf2 introuvable. Installez fpdf2 et créez pdf_generator.py.", file=sys.stderr)
+
+        if args.json:
+            print(json.dumps(asdict(r), indent=2, default=str))
+        else:
+            print_report(r)
 
 if __name__ == "__main__":
     main()

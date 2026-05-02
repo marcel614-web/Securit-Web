@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
 Serveur Web Flask pour SSL Scanner
-Interface web type SSL Labs
+Ajouts : endpoint de téléchargement PDF
 """
 
 import json
 import threading
+import io
+import tempfile
+import os
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
 from dataclasses import asdict
 
 from ssl_scanner import SSLScanner, ScanResult
+from pdf_generator import generate_pdf_report
 
 app = Flask(__name__)
 
-# ── Stockage en mémoire des scans récents ──
 scan_history: dict = {}
 scan_history_lock = threading.Lock()
 MAX_HISTORY = 50
@@ -27,7 +30,6 @@ def store_result(result: ScanResult):
             "result": asdict(result),
             "timestamp": datetime.utcnow().isoformat()
         }
-        # Limiter l'historique
         if len(scan_history) > MAX_HISTORY:
             oldest_key = next(iter(scan_history))
             del scan_history[oldest_key]
@@ -40,21 +42,16 @@ def index():
 
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    """Lance un scan SSL et retourne les résultats en JSON."""
     data = request.get_json()
     if not data:
         return jsonify({"error": "Corps JSON requis"}), 400
-
     host = data.get("host", "").strip().rstrip("/")
     if not host:
         return jsonify({"error": "Champ 'host' requis"}), 400
-
-    # Nettoyer l'URL
     if "://" in host:
         host = host.split("://", 1)[1]
     if "/" in host:
         host = host.split("/")[0]
-
     try:
         port = int(data.get("port", 443))
         if not (1 <= port <= 65535):
@@ -69,7 +66,6 @@ def api_scan():
     scanner = SSLScanner(timeout=timeout,
                          check_protocols=check_protocols,
                          check_headers=check_headers)
-
     try:
         result = scanner.scan(host, port)
         store_result(result)
@@ -80,7 +76,6 @@ def api_scan():
 
 @app.route("/api/history", methods=["GET"])
 def api_history():
-    """Retourne l'historique des scans récents."""
     with scan_history_lock:
         history = [
             {
@@ -97,7 +92,6 @@ def api_history():
 
 @app.route("/api/scan/<path:host>", methods=["GET"])
 def api_scan_get(host):
-    """Scan via GET pour faciliter les tests."""
     port = int(request.args.get("port", 443))
     timeout = min(float(request.args.get("timeout", 15)), 30)
     check_protocols = request.args.get("protocols", "1") != "0"
@@ -111,6 +105,87 @@ def api_scan_get(host):
         return jsonify(asdict(result))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/scan/download", methods=["GET"])
+def api_scan_download():
+    """Télécharge le dernier scan pour un hôte donné (JSON)."""
+    host = request.args.get("host", "")
+    port = int(request.args.get("port", 443))
+    key = f"{host}:{port}"
+    with scan_history_lock:
+        entry = scan_history.get(key)
+    if not entry:
+        return jsonify({"error": "Aucun scan trouvé pour cet hôte/port dans l'historique."}), 404
+    result_json = json.dumps(entry["result"], indent=2, default=str)
+    return Response(
+        result_json,
+        mimetype="application/json",
+        headers={"Content-Disposition": f"attachment;filename=ssl_scan_{host}_{port}.json"}
+    )
+
+
+@app.route("/api/scan/pdf", methods=["GET"])
+def api_scan_pdf():
+    """Génère et télécharge un rapport PDF pour un scan récent."""
+    host = request.args.get("host", "")
+    port = int(request.args.get("port", 443))
+    key = f"{host}:{port}"
+    with scan_history_lock:
+        entry = scan_history.get(key)
+    if not entry:
+        return jsonify({"error": "Aucun scan trouvé pour cet hôte/port dans l'historique."}), 404
+
+    # Reconstruction du ScanResult depuis le dictionnaire
+    from ssl_scanner import CertificateInfo, ProtocolSupport, SecurityHeaders, CipherSuite, VulnerabilityCheck
+
+    def _dict_to_dataclass(cls, d):
+        if d is None: return None
+        try:
+            return cls(**d)
+        except:
+            return None
+
+    result_dict = entry["result"]
+    cert = _dict_to_dataclass(CertificateInfo, result_dict.get("certificate"))
+    proto = _dict_to_dataclass(ProtocolSupport, result_dict.get("protocol_support"))
+    headers = _dict_to_dataclass(SecurityHeaders, result_dict.get("security_headers"))
+    ciphers = [cs for cs in (_dict_to_dataclass(CipherSuite, cs) for cs in result_dict.get("cipher_suites", [])) if cs]
+    vulns = [v for v in (_dict_to_dataclass(VulnerabilityCheck, v) for v in result_dict.get("vulnerabilities", [])) if v]
+
+    result = ScanResult(
+        host=result_dict["host"],
+        port=result_dict["port"],
+        ip_address=result_dict.get("ip_address", "N/A"),
+        scan_time=result_dict.get("scan_time", "N/A"),
+        duration_ms=result_dict.get("duration_ms", 0.0),
+        grade=result_dict.get("grade", "N/A"),
+        score=result_dict.get("score", 0),
+        certificate=cert,
+        protocol_support=proto,
+        cipher_suites=ciphers,
+        security_headers=headers,
+        vulnerabilities=vulns,
+        errors=result_dict.get("errors", []),
+        warnings=result_dict.get("warnings", [])
+    )
+
+    # Générer le PDF dans un fichier temporaire
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            generate_pdf_report(result, tmp.name)
+            tmp.flush()
+            with open(tmp.name, "rb") as f:
+                pdf_bytes = f.read()
+        os.unlink(tmp.name)
+    except Exception as e:
+        return jsonify({"error": f"Erreur lors de la génération du PDF : {str(e)}"}), 500
+
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={"Content-Disposition": f"attachment;filename=ssl_scan_{host}_{port}.pdf"}
+    )
 
 
 if __name__ == "__main__":

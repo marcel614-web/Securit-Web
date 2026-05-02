@@ -129,7 +129,6 @@
   .btn-scan:active { transform: scale(0.98); }
   .btn-scan:disabled { opacity: 0.4; cursor: not-allowed; }
 
-  /* Progress */
   .progress-container { display: none; margin-top: 1rem; }
   .progress-label {
     font-size: 0.78rem;
@@ -151,7 +150,6 @@
     width: 0%;
   }
 
-  /* Résultats */
   #results { display: none; }
 
   .grade-banner {
@@ -212,7 +210,6 @@
     transition: width 0.8s cubic-bezier(0.25, 1, 0.5, 1);
   }
 
-  /* Grid de cartes */
   .cards-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -265,7 +262,6 @@
     word-break: break-all;
   }
 
-  /* Protocoles */
   .proto-list { display: flex; flex-direction: column; gap: 0.5rem; }
   .proto-item {
     display: flex;
@@ -286,7 +282,6 @@
   .badge-bad   { background: rgba(239,68,68,0.15); color: #ef4444; }
   .badge-off   { background: rgba(100,116,139,0.12); color: #64748b; }
 
-  /* Vulnérabilités */
   .vuln-item {
     display: flex;
     align-items: flex-start;
@@ -306,7 +301,6 @@
   .sev-info     { color: #64748b; }
   .sev-ok       { color: #10b981; }
 
-  /* Cipher suites */
   .cipher-item {
     display: flex;
     align-items: center;
@@ -321,7 +315,6 @@
   .cipher-name { flex: 1; }
   .cipher-bits { color: var(--text-dim); font-size: 0.72rem; }
 
-  /* Warnings & Errors */
   .alert-list { display: flex; flex-direction: column; gap: 0.4rem; }
   .alert-item {
     font-size: 0.8rem;
@@ -335,7 +328,6 @@
   .alert-error { background: rgba(239,68,68,0.08); border-color: #ef4444; color: #fca5a5; }
   .alert-warn  { background: rgba(245,158,11,0.08); border-color: #f59e0b; color: #fcd34d; }
 
-  /* Historique */
   .history-section { margin-top: 2rem; }
   .history-title {
     font-size: 0.75rem;
@@ -508,6 +500,10 @@ function scoreColor(s) {
   return '#ef4444';
 }
 
+function downloadPDF(host, port) {
+    window.location.href = `/api/scan/pdf?host=${encodeURIComponent(host)}&port=${port}`;
+}
+
 function renderResults(d) {
   const el = document.getElementById('results');
   el.style.display = 'block';
@@ -527,6 +523,10 @@ function renderResults(d) {
       </div>
       <div class="score-bar-track">
         <div class="score-bar-fill" id="score-anim" style="width:0%;background:${scoreColor(sc)}"></div>
+      </div>
+      <div style="margin-top:1.2rem;">
+        <button class="btn-scan" onclick="downloadScan('${esc(d.host)}', ${d.port})" style="background:#7c3aed;">Télécharger JSON</button>
+        <button class="btn-scan" onclick="downloadPDF('${esc(d.host)}', ${d.port})" style="background:#f97316;">Télécharger PDF</button>
       </div>
     </div>
   </div>`;
@@ -618,7 +618,7 @@ function renderResults(d) {
 
   html += `</div>`; // fin cards-grid
 
-  // Vulnérabilités (pleine largeur)
+  // Vulnérabilités
   if (d.vulnerabilities && d.vulnerabilities.length) {
     const sevOrder = {critical:0,high:1,medium:2,low:3,info:4};
     const sorted = [...d.vulnerabilities].sort((a,b) => {
@@ -682,6 +682,10 @@ function esc(str) {
     .replace(/'/g, '&#39;');
 }
 
+function downloadScan(host, port) {
+    window.location.href = `/api/scan/download?host=${encodeURIComponent(host)}&port=${port}`;
+}
+
 async function loadHistory() {
   try {
     const resp = await fetch('/api/history');
@@ -706,7 +710,6 @@ function quickScan(host) {
   startScan();
 }
 
-// Entrée clavier
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('host-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') startScan();
